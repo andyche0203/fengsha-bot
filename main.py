@@ -80,87 +80,89 @@ def jitter(ms):
 
 
 # ======================= Steam 抓取（修复核心） =======================
-def _steam_once():
-    """抓一次 Steam appreviews，成功返回 dict，失败抛异常（含原始响应诊断）。"""
-    req = urllib.request.Request(STEAM_URL, headers=STEAM_HEADERS)
+def _steam_try(url, headers):
+    """尝试一次 appreviews，成功返回样本dict，失败抛异常(含响应头诊断)。"""
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=25) as r:
         status = r.status
         raw = r.read().decode("utf-8", "replace")
+        ctype = r.headers.get("Content-Type", "")
+        clen = r.headers.get("Content-Length", "未知")
     if status != 200:
-        raise RuntimeError(f"HTTP {status}")
+        raise RuntimeError(f"HTTP {status} (CT={ctype})")
     if not raw.strip():
-        raise RuntimeError("HTTP 200 但响应体为空(疑似数据中心IP被Steam拦截)")
+        raise RuntimeError(f"200但空响应(CT={ctype}, CL={clen})")
     d = json.loads(raw)
     q = (d or {}).get("query_summary")
     if not q or int(q.get("total_reviews", 0)) <= 0:
-        raise RuntimeError("返回数据无效(total_reviews=0或无query_summary)")
+        raise RuntimeError(f"无效JSON(无query_summary): {raw[:120]}")
     return {
-        "total": int(q.get("total_reviews", 0)),
-        "pos": int(q.get("total_positive", 0)),
-        "neg": int(q.get("total_negative", 0)),
+        "total": int(q["total_reviews"]),
+        "pos": int(q["total_positive"]),
+        "neg": int(q["total_negative"]),
         "desc": q.get("review_score_desc", "") or "",
     }
 
 
 def fetch_steam():
-    """真实浏览器头 + 指数退避重试 + 3 个一致样本提前停 + 众数投票 + 失败诊断。"""
-    samples = []
-    last_err = "未知"
-    for i in range(8):
+    """多套 URL/头部变体自动重试 + 失败带完整诊断（对抗 GitHub 出口IP被Steam限流）。"""
+    base = f"https://store.steampowered.com/appreviews/{APPID}"
+    ua_chrome = STEAM_HEADERS["User-Agent"]
+    ua_safari = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                 "(KHTML, like Gecko) Version/16.1 Safari/605.1.15")
+    variants = [
+        ("A:原版(Referer+Chrome)", f"{base}?json=1&language=all&purchase_type=all&num_per_page=0&review_type=all", STEAM_HEADERS),
+        ("B:精简+Chrome", f"{base}?json=1&language=all&num_per_page=0", {"User-Agent": ua_chrome, "Accept": "application/json, */*"}),
+        ("C:最简+Safari", f"{base}?json=1&num_per_page=0", {"User-Agent": ua_safari}),
+        ("D:identity编码", f"{base}?json=1&language=all&num_per_page=0", {"User-Agent": ua_chrome, "Accept-Encoding": "identity", "Accept": "application/json"}),
+    ]
+    diag = []
+    for vname, url, hdrs in variants:
         try:
-            s = _steam_once()
-            samples.append(s)
-            if len(samples) >= 3:   # 拿到 3 个就停，少打请求、降低被限流概率
-                break
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}"
-            time.sleep(jitter(3.0 if e.code in (429, 503) else 1.2))
-            continue
+            s = _steam_try(url, hdrs)
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        time.sleep(jitter(0.9 + i * 0.3))
-    if not samples:
-        return {"ok": False, "err": last_err}
-
-    # 众数：total_reviews 出现最多的样本（排除偶发异常值）
-    tally = {}
-    best, best_n = samples[0], 0
-    for x in samples:
-        tally[x["total"]] = tally.get(x["total"], 0) + 1
-        if tally[x["total"]] > best_n:
-            best_n, best = tally[x["total"]], x
-    best["rate"] = round(best["pos"] / best["total"] * 100, 2) if best["total"] else 0
-    return {"ok": True, "data": best}
+            diag.append(f"{vname}→{e}")
+            continue
+        s["rate"] = round(s["pos"] / s["total"] * 100, 2) if s["total"] else 0
+        return {"ok": True, "data": s, "variant": vname}
+    return {"ok": False, "err": "全部变体失败 | " + " / ".join(diag)}
 
 
-# ======================= 小黑盒 抓取（沿用已验证路径） =======================
+# ======================= 小黑盒 抓取（兼容新旧结构） =======================
 def fetch_heybox():
     try:
         d = http_get_json(HEYBOX_URL, headers=HEYBOX_HEADERS)
-        g = (d or {}).get("data", {}).get("game", {})
-        if not g:
-            # 诊断：把响应结构 dump 出来，方便定位是接口变更还是 IP 被限
-            top_keys = list(d.keys()) if isinstance(d, dict) else f"type={type(d).__name__}"
-            data_block = (d or {}).get("data")
-            data_keys = list(data_block.keys()) if isinstance(data_block, dict) else f"type={type(data_block).__name__}"
-            raw_preview = json.dumps(d, ensure_ascii=False)[:300]
+        if not isinstance(d, dict):
+            return {"ok": False, "err": f"响应非dict: {type(d).__name__}"}
+        # 兼容：旧 data.game 或 新 result
+        data_block = d.get("data")
+        g = ((data_block.get("game") if isinstance(data_block, dict) else None)
+             or d.get("result") or {})
+        if not isinstance(g, dict) or not g:
+            raw_full = json.dumps(d, ensure_ascii=False)[:1500]
             return {"ok": False,
-                    "err": f"game字段缺失 | top_keys={top_keys} | data_keys={data_keys} | raw={raw_preview}"}
-        cs = g.get("comment_stats", {}) or {}
-        return {
-            "ok": True,
-            "rating": float(g.get("score") or 0),
-            "num": int(cs.get("score_comment") or 0),
-            "stars": {
-                5: float(g.get("star_5") or 0),
-                4: float(g.get("star_4") or 0),
-                3: float(g.get("star_3") or 0),
-                2: float(g.get("star_2") or 0),
-                1: float(g.get("star_1") or 0),
-            },
-        }
+                    "err": f"无game/result | top_keys={list(d.keys())} | raw={raw_full}"}
+
+        def gv(*keys, default=0):
+            cur = g
+            for k in keys:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    return default
+            return cur
+
+        rating = float(gv("score") or gv("game_score") or 0)
+        cs_raw = gv("comment_stats")
+        cs = cs_raw if isinstance(cs_raw, dict) else {}
+        num = int(cs.get("score_comment") or cs.get("comment_count") or 0)
+        stars = {i: float(gv(f"star_{i}") or 0) for i in (5, 4, 3, 2, 1)}
+        if rating == 0 and num == 0 and not any(stars.values()):
+            return {"ok": False,
+                    "err": f"结构无评分字段 | g_keys={list(g.keys())} | raw={json.dumps(g, ensure_ascii=False)[:1200]}"}
+        return {"ok": True, "rating": rating, "num": num, "stars": stars}
     except Exception as e:
-        return {"ok": False, "err": f"超时/解析失败({e})"}
+        return {"ok": False, "err": f"异常({type(e).__name__}: {e})"}
 
 
 # ======================= 企业微信 单聊 =======================
