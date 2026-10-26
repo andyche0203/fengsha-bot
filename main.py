@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-烽沙测评播报 —— 干净托管版 (Railway / Render / Fly / GitHub Actions 通用)
+烽沙测评播报 —— GitHub Actions / 常驻服务通用版
 纯 Python 标准库，无 pip 依赖。
 
-功能：每小时抓取 Steam + 小黑盒 评分 → 企业微信自建应用单聊推 8 人。
-相对 Cloudflare 旧版改进：
-  - Steam 抓取加真实浏览器头 + 指数退避重试 + 3 个一致样本提前停 + 失败写具体原因
-  - 出口 IP 更干净（Railway/Render/Fly 正常云 IP，Steam 不拦），根治 Cloudflare 免费层被限流
-  - 状态用文件持久化，替代 Cloudflare KV
+功能：抓取 Steam + 小黑盒评分，计算较上次变化后推送企业微信。
+Steam 使用官方 GetAppReviews Web API；小黑盒兼容当前 result/comment_stats 结构。
 
 运行方式：
   python main.py              # 常驻模式：后台每小时跑 + 提供 HTTP /run 手动触发
@@ -17,7 +14,7 @@
 
 环境变量（在托管平台后台配置，密钥不要写进代码）：
   WECOM_CORPID  /  WECOM_AGENTID  /  WECOM_SECRET   # 企业微信自建应用凭证
-  WECOM_TOUSERS                                     # 逗号分隔 userid，如 CD1971,CD1718,...（缺省用内置 8 人）
+  WECOM_TOUSERS                                     # 必填，逗号分隔 userid；不配置时拒绝推送
   STEAM_APPID                                       # 默认 1733690
   STATE_FILE                                        # 默认 ./state.json（Railway 挂卷后建议设 /data/state.json）
   LOOP_INTERVAL                                     # 默认 3600 秒
@@ -28,10 +25,9 @@ import os
 import sys
 import json
 import time
-import random
+from datetime import datetime, timedelta, timezone
 import threading
 import urllib.request
-import urllib.error
 import urllib.parse
 import http.server
 
@@ -41,14 +37,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "./state.json")
 LOOP_INTERVAL = int(os.environ.get("LOOP_INTERVAL", "3600"))
 PORT = int(os.environ.get("PORT", "8080"))
 
-DEFAULT_TOUSERS = ["CD1971", "CD1718", "CD1371", "CD2013",
-                   "CD1687", "CD2577"]
-
-STEAM_URL = (
-    f"https://store.steampowered.com/appreviews/{APPID}"
-    f"?json=1&language=all&purchase_type=all&num_per_page=0&review_type=all"
-)
-HEYBOX_URL = f"https://api.xiaoheihe.cn/game/web/get_game_detail/?_time={int(time.time())}&appid={APPID}"
+STEAM_API_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
+HEYBOX_API_URL = "https://api.xiaoheihe.cn/game/web/get_game_detail/"
 
 STEAM_HEADERS = {
     "User-Agent": (
@@ -75,101 +65,80 @@ def http_get_json(url, headers=None, timeout=25):
         return json.loads(r.read().decode("utf-8"))
 
 
-def jitter(ms):
-    return ms + random.uniform(0, 0.4)
-
-
-# ======================= Steam 抓取（修复核心） =======================
-def _steam_try(url, headers):
-    """尝试一次 appreviews，成功返回样本dict，失败抛异常(含响应头诊断)。"""
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=25) as r:
-        status = r.status
-        raw = r.read().decode("utf-8", "replace")
-        ctype = r.headers.get("Content-Type", "")
-        clen = r.headers.get("Content-Length", "未知")
-    if status != 200:
-        raise RuntimeError(f"HTTP {status} (CT={ctype})")
-    if not raw.strip():
-        raise RuntimeError(f"200但空响应(CT={ctype}, CL={clen})")
-    d = json.loads(raw)
-    q = (d or {}).get("query_summary")
-    if not q or int(q.get("total_reviews", 0)) <= 0:
-        raise RuntimeError(f"无效JSON(无query_summary): {raw[:120]}")
+# ======================= Steam 官方评测 API =======================
+def parse_steam_payload(payload):
+    response = payload.get("response", payload)
+    summary = response.get("query_summary", {})
+    total = int(summary.get("total_reviews", 0))
+    if total <= 0:
+        raise ValueError(f"无有效 query_summary: {json.dumps(payload, ensure_ascii=False)[:300]}")
     return {
-        "total": int(q["total_reviews"]),
-        "pos": int(q["total_positive"]),
-        "neg": int(q["total_negative"]),
-        "desc": q.get("review_score_desc", "") or "",
+        "total": total,
+        "pos": int(summary["total_positive"]),
+        "neg": int(summary["total_negative"]),
+        "desc": summary.get("review_score_desc", "") or "",
     }
 
 
 def fetch_steam():
-    """多套 URL/头部变体自动重试 + 失败带完整诊断（对抗 GitHub 出口IP被Steam限流）。"""
-    base = f"https://store.steampowered.com/appreviews/{APPID}"
-    ua_chrome = STEAM_HEADERS["User-Agent"]
-    ua_safari = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-                 "(KHTML, like Gecko) Version/16.1 Safari/605.1.15")
-    variants = [
-        ("A:原版(Referer+Chrome)", f"{base}?json=1&language=all&purchase_type=all&num_per_page=0&review_type=all", STEAM_HEADERS),
-        ("B:精简+Chrome", f"{base}?json=1&language=all&num_per_page=0", {"User-Agent": ua_chrome, "Accept": "application/json, */*"}),
-        ("C:最简+Safari", f"{base}?json=1&num_per_page=0", {"User-Agent": ua_safari}),
-        ("D:identity编码", f"{base}?json=1&language=all&num_per_page=0", {"User-Agent": ua_chrome, "Accept-Encoding": "identity", "Accept": "application/json"}),
-    ]
-    diag = []
-    for vname, url, hdrs in variants:
-        try:
-            s = _steam_try(url, hdrs)
-        except Exception as e:
-            diag.append(f"{vname}→{e}")
-            continue
-        s["rate"] = round(s["pos"] / s["total"] * 100, 2) if s["total"] else 0
-        return {"ok": True, "data": s, "variant": vname}
-    return {"ok": False, "err": "全部变体失败 | " + " / ".join(diag)}
+    """Fetch the first-page all-language summary from Steam's current API."""
+    params = {
+        "appid": APPID,
+        "filter": 0,
+        "day_range": 0,
+        "languages": ["all"],
+        "review_type": 0,
+        "purchase_type": 1,
+        "num_per_page": 1,
+    }
+    url = STEAM_API_URL + "?" + urllib.parse.urlencode({
+        "input_json": json.dumps(params, separators=(",", ":"))
+    })
+    try:
+        payload = http_get_json(url, headers=STEAM_HEADERS, timeout=20)
+        data = parse_steam_payload(payload)
+        data["rate"] = round(data["pos"] / data["total"] * 100, 2)
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "err": f"{type(e).__name__}: {e}"}
 
 
 # ======================= 小黑盒 抓取（兼容新旧结构） =======================
+def parse_heybox_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError(f"响应不是对象: {type(payload).__name__}")
+    data_block = payload.get("data")
+    game = ((data_block.get("game") if isinstance(data_block, dict) else None)
+            or payload.get("result") or {})
+    if not isinstance(game, dict) or not game:
+        raise ValueError(f"缺少 game/result，顶层字段: {list(payload)}")
+    stats = game.get("comment_stats") or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    rating = float(game.get("score") or game.get("game_score") or 0)
+    count = int(stats.get("score_comment") or stats.get("comment_count") or 0)
+    stars = {i: round(float(stats.get(f"star_{i}") or game.get(f"star_{i}") or 0), 2)
+             for i in (5, 4, 3, 2, 1)}
+    if rating == 0 and count == 0 and not any(stars.values()):
+        raise ValueError(f"结构无评分字段，result 字段: {list(game)}")
+    return {"ok": True, "rating": rating, "num": count, "stars": stars}
+
+
 def fetch_heybox():
     try:
-        d = http_get_json(HEYBOX_URL, headers=HEYBOX_HEADERS)
-        if not isinstance(d, dict):
-            return {"ok": False, "err": f"响应非dict: {type(d).__name__}"}
-        # 兼容：旧 data.game 或 新 result
-        data_block = d.get("data")
-        g = ((data_block.get("game") if isinstance(data_block, dict) else None)
-             or d.get("result") or {})
-        if not isinstance(g, dict) or not g:
-            raw_full = json.dumps(d, ensure_ascii=False)[:1500]
-            return {"ok": False,
-                    "err": f"无game/result | top_keys={list(d.keys())} | raw={raw_full}"}
-
-        def gv(*keys, default=0):
-            cur = g
-            for k in keys:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    return default
-            return cur
-
-        rating = float(gv("score") or gv("game_score") or 0)
-        cs_raw = gv("comment_stats")
-        cs = cs_raw if isinstance(cs_raw, dict) else {}
-        num = int(cs.get("score_comment") or cs.get("comment_count") or 0)
-        stars = {i: float(gv(f"star_{i}") or 0) for i in (5, 4, 3, 2, 1)}
-        if rating == 0 and num == 0 and not any(stars.values()):
-            return {"ok": False,
-                    "err": f"结构无评分字段 | g_keys={list(g.keys())} | raw={json.dumps(g, ensure_ascii=False)[:1200]}"}
-        return {"ok": True, "rating": rating, "num": num, "stars": stars}
+        url = f"{HEYBOX_API_URL}?_time={int(time.time())}&appid={APPID}"
+        return parse_heybox_payload(http_get_json(url, headers=HEYBOX_HEADERS))
     except Exception as e:
-        return {"ok": False, "err": f"异常({type(e).__name__}: {e})"}
+        return {"ok": False, "err": f"{type(e).__name__}: {e}"}
 
 
 # ======================= 企业微信 单聊 =======================
 def get_wecom_token(corpid, secret):
     u = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corpid}&corpsecret={secret}"
     d = http_get_json(u)
-    return d.get("access_token")
+    if d.get("errcode") != 0 or not d.get("access_token"):
+        raise RuntimeError(f"企微 token 接口错误: errcode={d.get('errcode')} errmsg={d.get('errmsg')}")
+    return d["access_token"]
 
 
 def send_wecom(token, agentid, touser, content):
@@ -183,7 +152,10 @@ def send_wecom(token, agentid, touser, content):
     req = urllib.request.Request(
         u, data=body, method="POST",
         headers={"Content-Type": "application/json; charset=utf-8"})
-    urllib.request.urlopen(req, timeout=15).read()
+    with urllib.request.urlopen(req, timeout=15) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if result.get("errcode") != 0:
+        raise RuntimeError(f"企微发送失败: errcode={result.get('errcode')} errmsg={result.get('errmsg')}")
 
 
 def push_wecom(content):
@@ -191,20 +163,18 @@ def push_wecom(content):
     agentid = os.environ.get("WECOM_AGENTID")
     secret = os.environ.get("WECOM_SECRET")
     raw = os.environ.get("WECOM_TOUSERS", "")
-    tousers = [u.strip() for u in raw.split(",") if u.strip()] or DEFAULT_TOUSERS
-
-    if not (corpid and agentid and secret):
-        print("[WARN] 缺少企业微信凭证，仅打印不推送:\n" + content)
-        return
-    try:
-        token = get_wecom_token(corpid, secret)
-        for u in tousers:
-            try:
-                send_wecom(token, agentid, u, content)
-            except Exception as e:
-                print(f"[ERR] 发给 {u} 失败: {e}")
-    except Exception as e:
-        print(f"[ERR] 获取企微 token 失败: {e}")
+    tousers = list(dict.fromkeys(u.strip() for u in raw.split(",") if u.strip()))
+    if not (corpid and agentid and secret and tousers):
+        raise RuntimeError("缺少企业微信配置；须显式设置凭证和 WECOM_TOUSERS，拒绝使用默认收件名单")
+    token = get_wecom_token(corpid, secret)
+    failures = []
+    for user in tousers:
+        try:
+            send_wecom(token, agentid, user, content)
+        except Exception as e:
+            failures.append(f"{user}: {e}")
+    if failures:
+        raise RuntimeError("部分企微消息发送失败: " + "; ".join(failures))
 
 
 # ======================= 状态（替代 KV） =======================
@@ -232,7 +202,8 @@ def run_once():
     last_steam = st.get("steam", {})
     last_hey = st.get("hey", {})
 
-    now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    beijing = timezone(timedelta(hours=8))
+    now = datetime.now(beijing).strftime("%Y-%m-%d %H:%M")
     lines = ["【烽沙测评播报】", f"时间：{now}"]
 
     if steam["ok"]:
