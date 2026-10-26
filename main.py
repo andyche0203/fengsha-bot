@@ -80,37 +80,44 @@ def jitter(ms):
 
 
 # ======================= Steam 抓取（修复核心） =======================
+def _steam_once():
+    """抓一次 Steam appreviews，成功返回 dict，失败抛异常（含原始响应诊断）。"""
+    req = urllib.request.Request(STEAM_URL, headers=STEAM_HEADERS)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        status = r.status
+        raw = r.read().decode("utf-8", "replace")
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    if not raw.strip():
+        raise RuntimeError("HTTP 200 但响应体为空(疑似数据中心IP被Steam拦截)")
+    d = json.loads(raw)
+    q = (d or {}).get("query_summary")
+    if not q or int(q.get("total_reviews", 0)) <= 0:
+        raise RuntimeError("返回数据无效(total_reviews=0或无query_summary)")
+    return {
+        "total": int(q.get("total_reviews", 0)),
+        "pos": int(q.get("total_positive", 0)),
+        "neg": int(q.get("total_negative", 0)),
+        "desc": q.get("review_score_desc", "") or "",
+    }
+
+
 def fetch_steam():
     """真实浏览器头 + 指数退避重试 + 3 个一致样本提前停 + 众数投票 + 失败诊断。"""
     samples = []
     last_err = "未知"
     for i in range(8):
         try:
-            req = urllib.request.Request(STEAM_URL, headers=STEAM_HEADERS)
-            with urllib.request.urlopen(req, timeout=25) as r:
-                if r.status != 200:
-                    last_err = f"HTTP {r.status}"
-                    time.sleep(jitter(3.0 if r.status in (429, 503) else 1.2))
-                    continue
-                d = json.loads(r.read().decode("utf-8"))
-            q = (d or {}).get("query_summary")
-            if q and int(q.get("total_reviews", 0)) > 0:
-                samples.append({
-                    "total": int(q.get("total_reviews", 0)),
-                    "pos": int(q.get("total_positive", 0)),
-                    "neg": int(q.get("total_negative", 0)),
-                    "desc": q.get("review_score_desc", "") or "",
-                })
-                if len(samples) >= 3:   # 拿到 3 个就停，少打请求、降低被限流概率
-                    break
-            else:
-                last_err = "返回数据为空(total_reviews=0)"
+            s = _steam_once()
+            samples.append(s)
+            if len(samples) >= 3:   # 拿到 3 个就停，少打请求、降低被限流概率
+                break
         except urllib.error.HTTPError as e:
             last_err = f"HTTP {e.code}"
             time.sleep(jitter(3.0 if e.code in (429, 503) else 1.2))
             continue
         except Exception as e:
-            last_err = f"超时/解析失败({e})"
+            last_err = f"{type(e).__name__}: {e}"
         time.sleep(jitter(0.9 + i * 0.3))
     if not samples:
         return {"ok": False, "err": last_err}
@@ -132,7 +139,13 @@ def fetch_heybox():
         d = http_get_json(HEYBOX_URL, headers=HEYBOX_HEADERS)
         g = (d or {}).get("data", {}).get("game", {})
         if not g:
-            return {"ok": False, "err": "game 字段缺失"}
+            # 诊断：把响应结构 dump 出来，方便定位是接口变更还是 IP 被限
+            top_keys = list(d.keys()) if isinstance(d, dict) else f"type={type(d).__name__}"
+            data_block = (d or {}).get("data")
+            data_keys = list(data_block.keys()) if isinstance(data_block, dict) else f"type={type(data_block).__name__}"
+            raw_preview = json.dumps(d, ensure_ascii=False)[:300]
+            return {"ok": False,
+                    "err": f"game字段缺失 | top_keys={top_keys} | data_keys={data_keys} | raw={raw_preview}"}
         cs = g.get("comment_stats", {}) or {}
         return {
             "ok": True,
