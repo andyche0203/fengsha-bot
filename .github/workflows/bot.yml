@@ -1,0 +1,41 @@
+name: 烽沙测评播报
+
+on:
+  schedule:
+    - cron: '0 1,4,10 * * *'   # 每天 09:00 / 12:00 / 18:00 (北京时间，对应 UTC 01:00/04:00/10:00)
+  workflow_dispatch:           # 允许在 Actions 页面手动点按钮立即运行
+
+permissions:
+  contents: write              # 允许把"较上次对比"状态写回仓库
+
+concurrency:
+  group: fengsha-broadcast
+  cancel-in-progress: false
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 运行播报并推送企业微信
+        env:
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
+          WECOM_TOUSERS: ${{ secrets.WECOM_TOUSERS }}
+        run: python main.py --once
+
+      - name: 保存对比状态(state.json 写回，保证"较上次"连续)
+        run: |
+          git config user.name "fengsha-bot"
+          git config user.email "bot@local"
+          git add state.json
+          git commit -m "chore: update review state" || echo "无变化，跳过提交"
+          git push
