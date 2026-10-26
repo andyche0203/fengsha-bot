@@ -157,7 +157,9 @@ def send_wecom(token, agentid, touser, content):
         result = json.loads(response.read().decode("utf-8"))
     if result.get("errcode") != 0:
         raise RuntimeError(f"企微发送失败: errcode={result.get('errcode')} errmsg={result.get('errmsg')}")
-
+    invalid_users = result.get("invaliduser")
+    if invalid_users:
+        raise RuntimeError(f"企业微信未识别收件人: {invalid_users}")
 
 def push_wecom(content):
     corpid = os.environ.get("WECOM_CORPID")
