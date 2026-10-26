@@ -1,1 +1,1 @@
-{"steam_last_err": "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"}
+{"steam_last_err": "", "steam": {"total": 1411, "pos": 1135, "neg": 276, "desc": "Very Positive", "rate": 80.44}, "hey": {"rating": 7.8, "num": 296}}
