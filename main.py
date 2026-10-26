@@ -90,6 +90,7 @@ def fetch_steam():
         "review_type": 0,
         "purchase_type": 1,
         "num_per_page": 1,
+        "display_language": "schinese",
     }
     url = STEAM_API_URL + "?" + urllib.parse.urlencode({
         "input_json": json.dumps(params, separators=(",", ":"))
